@@ -1,4 +1,31 @@
+require 'singleton'
 require 'puppet/provider/package'
+
+class PkgngVersionChecker
+  include Singleton
+
+  def latest_version(origin)
+    updates[origin]
+  end
+
+  def updates
+    return @updates if @updates
+
+    Puppet.debug 'Listing packages with updates'
+    @updates = {}
+    pkg('version', '-voRUL=').lines.each do |line|
+      if line =~ /^([^\s]+)\s.*\(remote has ([^)]+)\)/
+        @updates[$1] = $2
+        Puppet.debug "#{$1} is updatable to #{$2}"
+      end
+    end
+    @updates
+  end
+
+  def pkg(*args)
+    Puppet::Util::Execution.execute(['/usr/local/sbin/pkg', *args])
+  end
+end
 
 Puppet::Type.type(:package).provide :pkgng, :parent => Puppet::Provider::Package do
   desc "A PkgNG provider for FreeBSD and DragonFly."
@@ -16,42 +43,18 @@ Puppet::Type.type(:package).provide :pkgng, :parent => Puppet::Provider::Package
     pkg(['query', '-a', '%n %v %o'])
   end
 
-  def self.get_version_list
-    pkg(['version', '-voRL='])
-  end
-
-  def self.get_latest_version(origin, version_list)
-    if latest_version = version_list.lines.find { |l| l =~ /^#{origin} / }
-      latest_version = latest_version.split(' ').last.split(')').first
-      return latest_version
-    end
-    nil
-  end
-
   def self.instances
     packages = []
     begin
       info = self.get_query
-      version_list = self.get_version_list
 
       unless info
         return packages
       end
 
       info.lines.each do |line|
-
-        name, version, origin = line.chomp.split(" ", 3)
-        latest_version  = get_latest_version(origin, version_list) || version
-
-        pkg = {
-          :ensure   => version,
-          :name     => name,
-          :provider => self.name,
-          :origin   => origin,
-          :version  => version,
-          :latest   => latest_version
-        }
-        packages << new(pkg)
+        hash = parse_line(line)
+        packages << new(hash)
       end
 
       return packages
@@ -67,6 +70,20 @@ Puppet::Type.type(:package).provide :pkgng, :parent => Puppet::Provider::Package
         resources[name].provider = provider
       end
     end
+  end
+
+  def self.parse_line(line)
+    name, version, origin = line.chomp.split(' ', 3)
+    latest_version  = PkgngVersionChecker.instance.latest_version(origin) || version
+
+    {
+      :ensure   => version,
+      :name     => name,
+      :provider => self.name,
+      :origin   => origin,
+      :version  => version,
+      :latest   => latest_version
+    }
   end
 
   def repo_tag_from_urn(urn)
@@ -113,12 +130,13 @@ Puppet::Type.type(:package).provide :pkgng, :parent => Puppet::Provider::Package
   end
 
   def query
-    if @property_hash[:ensure] == nil
-      return nil
-    else
-      version = @property_hash[:version]
-      return { :version => version }
+    begin
+      output = pkg('query', '%n %v %o', resource[:name])
+    rescue Puppet::ExecutionFailure
+      return {:ensure => :absent, :status => 'missing', :name => resource[:name]}
     end
+
+    self.class.parse_line(output)
   end
 
   def version
